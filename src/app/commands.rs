@@ -1,0 +1,565 @@
+//! Slash commands: the command list, the popup shown while a `/` prefix is
+//! being typed, and `Enter` dispatch (command vs. chat message).
+
+use crate::app::{App, Cell, Overlay};
+
+pub struct SlashCmd {
+    pub name: &'static str,
+    pub desc: &'static str,
+}
+
+pub const SLASH_COMMANDS: &[SlashCmd] = &[
+    SlashCmd {
+        name: "/help",
+        desc: "Show keyboard shortcuts",
+    },
+    SlashCmd {
+        name: "/new",
+        desc: "Start a new conversation",
+    },
+    SlashCmd {
+        name: "/history",
+        desc: "Browse saved conversations",
+    },
+    SlashCmd {
+        name: "/code",
+        desc: "Browse & copy code blocks",
+    },
+    SlashCmd {
+        name: "/model",
+        desc: "Pick a model from the API's list",
+    },
+    SlashCmd {
+        name: "/provider",
+        desc: "Select API provider",
+    },
+    SlashCmd {
+        name: "/agent",
+        desc: "Toggle agent mode (sandbox tools)",
+    },
+    SlashCmd {
+        name: "/network",
+        desc: "Toggle shell network access for this run",
+    },
+    SlashCmd {
+        name: "/web",
+        desc: "Toggle web tools for this run",
+    },
+    SlashCmd {
+        name: "/approve",
+        desc: "Toggle tool approval: auto / manual",
+    },
+    SlashCmd {
+        name: "/sandbox",
+        desc: "Show or set agent target dir",
+    },
+    SlashCmd {
+        name: "/quit",
+        desc: "Exit chatTUI",
+    },
+];
+
+impl App {
+    /// Tab: complete the highlighted slash command into the composer.
+    pub fn accept_slash(&mut self) {
+        let Some(name) = self
+            .slash_filtered()
+            .get(self.slash_selected)
+            .map(|command| command.name)
+        else {
+            return;
+        };
+        self.set_composer_text(format!("{} ", name));
+        self.on_composer_changed();
+    }
+
+    pub fn slash_up(&mut self) {
+        let len = self.slash_filtered().len();
+        if len > 0 {
+            self.slash_selected = (self.slash_selected + len - 1) % len;
+        }
+    }
+
+    pub fn slash_down(&mut self) {
+        let len = self.slash_filtered().len();
+        if len > 0 {
+            self.slash_selected = (self.slash_selected + 1) % len;
+        }
+    }
+
+    /// The slash popup is open while the composer starts with `/` and an
+    /// unambiguous command prefix is being typed.
+    pub fn slash_filtered(&self) -> Vec<&'static SlashCmd> {
+        if self.overlay.is_some() {
+            return Vec::new();
+        }
+        let text = self.composer.trim_start();
+        if !text.starts_with('/') {
+            return Vec::new();
+        }
+        let rest = &text[1..];
+        if rest.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.name[1..].starts_with(rest))
+            .collect()
+    }
+
+    pub fn slash_open(&self) -> bool {
+        !self.slash_filtered().is_empty()
+    }
+
+    /// `Enter`: dispatch the highlighted slash command, run a typed command,
+    /// or send the message to the model.
+    pub fn submit(&mut self) {
+        if self.overlay.is_some() || self.streaming {
+            return;
+        }
+        if self.slash_open() {
+            let name = match self.slash_filtered().get(self.slash_selected) {
+                Some(command) => command.name.to_string(),
+                None => return,
+            };
+            self.composer.clear();
+            self.cursor = 0;
+            self.history_nav = None;
+            self.run_command(&name);
+            return;
+        }
+        let text = self.composer.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if text.len() > crate::app::MAX_COMPOSER_BYTES {
+            self.push_error("message exceeds the 1 MiB composer limit".into());
+            return;
+        }
+        self.composer.clear();
+        self.cursor = 0;
+        self.history_nav = None;
+        if text.starts_with('/') {
+            self.run_command(&text);
+            return;
+        }
+        self.prompt_history.push(text.clone());
+        self.cells.push(Cell::User(text.clone()));
+        let saved = self.sessions.add_message("user", text);
+        self.report_save(saved);
+        if let Err(error) = self.start_stream() {
+            self.push_error(error.to_string());
+        }
+    }
+
+    fn run_command(&mut self, text: &str) {
+        let mut parts = text.splitn(2, char::is_whitespace);
+        let command = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(':')
+            .to_ascii_lowercase();
+        let argument = parts.next().unwrap_or("").trim().to_string();
+        match command.as_str() {
+            "/help" => self.overlay = Some(Overlay::Shortcuts),
+            "/new" => self.new_chat(),
+            "/history" => self.open_history(),
+            "/code" => self.open_code(),
+            "/agent" => {
+                self.agent_mode = !self.agent_mode;
+                let status = if self.agent_mode {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                self.push_notice(format!("agent mode {}", status));
+                if self.agent_mode && !self.config.sandbox.enabled {
+                    self.push_notice(
+                        "sandbox is disabled in config.json - tools will not work".into(),
+                    );
+                } else if self.agent_mode && !self.sandbox.has_target() {
+                    self.push_notice(
+                        "no target directory — set one with /sandbox <path> before agent writes"
+                            .into(),
+                    );
+                }
+            }
+            "/network" => {
+                if !argument.is_empty() {
+                    self.push_error(
+                        "use /network without arguments to toggle shell network access".into(),
+                    );
+                    return;
+                }
+                self.sandbox.network_enabled = !self.sandbox.network_enabled;
+                self.push_network_status();
+            }
+            "/web" => {
+                if !argument.is_empty() {
+                    self.push_error("use /web without arguments to toggle web tools".into());
+                    return;
+                }
+                self.sandbox.web_enabled = !self.sandbox.web_enabled;
+                self.push_web_status();
+            }
+            "/approve" => {
+                // No argument toggles; naming the mode sets it, so a typed
+                // `/approve manual` can never flip the wrong way.
+                let manual = match argument.to_ascii_lowercase().as_str() {
+                    "" => !self.manual_approval,
+                    "manual" => true,
+                    "auto" => false,
+                    other => {
+                        self.push_error(format!(
+                            "unknown approval mode: '{other}' — use /approve, /approve auto or /approve manual"
+                        ));
+                        return;
+                    }
+                };
+                self.manual_approval = manual;
+                let notice = if manual {
+                    "approval: manual — you will be asked before the agent writes or edits files or runs shell commands (y approve, n deny)"
+                } else {
+                    "approval: auto — no extra prompts (web requests and ask-before-* permission modes still require approval)"
+                };
+                self.push_notice(notice.into());
+            }
+            "/sandbox" => {
+                if argument.is_empty() {
+                    self.push_sandbox_status();
+                } else if let Err(error) = self.set_sandbox_target(&argument) {
+                    self.push_error(error);
+                } else {
+                    self.push_notice(format!(
+                        "sandbox target set to {}",
+                        self.sandbox.config.workspace_root.display()
+                    ));
+                }
+            }
+            "/model" => {
+                if argument.is_empty() {
+                    self.open_models();
+                } else {
+                    // Resolve against the cached model list when one is
+                    // available (exact, unique prefix or unique suffix);
+                    // anything else is set exactly as typed.
+                    let model = self.lookup_model(&argument);
+                    self.config.model = model.clone();
+                    if !self.models.ids.is_empty() && !self.models.ids.iter().any(|id| *id == model)
+                    {
+                        self.push_notice(format!(
+                            "model set to {model} — not in the API's model list"
+                        ));
+                    } else {
+                        self.push_notice(format!("model set to {model}"));
+                    }
+                }
+            }
+            "/provider" => {
+                if argument.is_empty() {
+                    self.open_providers();
+                } else {
+                    if let Some(p) = self.config.find_provider(&argument) {
+                        self.set_active_provider(&p.id);
+                    } else {
+                        let available = self
+                            .config
+                            .providers()
+                            .iter()
+                            .map(|p| p.id.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.push_error(format!(
+                            "unknown provider: '{argument}' — available: {available}"
+                        ));
+                    }
+                }
+            }
+            "/quit" => self.should_quit = true,
+            other => self.push_error(format!("unknown command: {other} — try /help")),
+        }
+    }
+
+    pub fn set_sandbox_target(&mut self, raw: &str) -> Result<(), String> {
+        match self.sandbox.set_target(raw) {
+            Ok(path) => {
+                self.config.sandbox.workspace_root = path.display().to_string();
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn push_sandbox_status(&mut self) {
+        let root = if self.sandbox.has_target() {
+            self.sandbox.config.workspace_root.display().to_string()
+        } else {
+            "(unset — /sandbox <path>)".to_string()
+        };
+        let status = if self.sandbox.config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let agent = if self.agent_mode { "on" } else { "off" };
+        let approval = if self.manual_approval {
+            "manual"
+        } else {
+            "auto"
+        };
+        self.push_notice(format!(
+            "sandbox: {status} | agent: {agent} | root: {root} | mode: {} | shell: {} | shell-timeout: {}s | os-isolation: {} | auto-approve: {} | approval: {approval}",
+            self.sandbox.config.permission_mode.as_str(),
+            self.sandbox.config.allow_shell,
+            self.sandbox.config.effective_shell_timeout().as_secs(),
+            self.sandbox.config.os_isolation.as_str(),
+            self.sandbox.config.auto_approve
+        ));
+        self.push_network_status();
+        self.push_web_status();
+        if !self.sandbox.has_target() {
+            self.push_notice(
+                "agent tools will not write until a target is set with /sandbox <dir>".into(),
+            );
+        }
+    }
+
+    fn push_network_status(&mut self) {
+        let state = if self.sandbox.network_enabled { "on" } else { "off" };
+        self.push_notice(format!(
+            "shell network: {state} — /network to toggle (web tools use /web)"
+        ));
+        if !self.sandbox.network_enabled {
+            self.push_notice("network off requires OS syscall isolation; shell commands will be refused if it is unavailable or disabled".into());
+        }
+    }
+
+    fn push_web_status(&mut self) {
+        let message = if !self.sandbox.web_enabled {
+            "web off — /web to enable".into()
+        } else if !self.agent_mode {
+            "web on, but agent tools are off — use /agent".into()
+        } else if let Err(error) = self.sandbox.check_web_access() {
+            format!("web on, but {error}")
+        } else {
+            "web on — web_search sends approved queries to Bing; fetch_url reads approved public URLs. Queries, URLs and results are saved in this chat.".into()
+        };
+        self.push_notice(message);
+    }
+
+    pub fn new_chat(&mut self) {
+        if self.streaming {
+            self.push_error("interrupt the current run before starting a new conversation".into());
+            return;
+        }
+        if self.sessions.current().messages.is_empty() {
+            self.push_notice("already in a new conversation".into());
+            return;
+        }
+        let saved = self.sessions.new_session();
+        self.rebuild_cells();
+        self.report_save(saved);
+        self.scroll_from_bottom = 0;
+        self.agent_iterations = 0;
+        self.pending_tool_calls.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::config::Config;
+    use crate::session::manager::SessionManager;
+
+    fn test_app() -> App {
+        App::new(Config::default(), SessionManager::for_tests())
+    }
+
+    #[test]
+    fn submit_routes_slash_commands() {
+        let mut app = test_app();
+        app.composer = "/model test-model".into();
+        app.submit();
+        assert_eq!(app.config.model, "test-model");
+        assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn network_command_toggles_session_state() {
+        let mut app = test_app();
+        assert!(app.sandbox.network_enabled);
+        app.composer = "/network".into();
+        app.submit();
+        assert!(!app.sandbox.network_enabled);
+        assert!(app.cells.iter().any(|cell| matches!(cell, Cell::Notice(text) if text.contains("shell network: off"))));
+        app.composer = "/network".into();
+        app.submit();
+        assert!(app.sandbox.network_enabled);
+        assert!(app.cells.iter().any(|cell| matches!(cell, Cell::Notice(text) if text.contains("shell network: on"))));
+        app.composer = "/network extra".into();
+        app.submit();
+        assert!(app.sandbox.network_enabled);
+        assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
+    }
+
+    #[test]
+    fn slash_popup_filters_by_prefix() {
+        let mut app = test_app();
+        app.composer = "/m".into();
+        let names: Vec<&str> = app.slash_filtered().iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["/model"]);
+        app.composer = "/model something".into();
+        assert!(!app.slash_open());
+    }
+
+    #[test]
+    fn unknown_command_is_reported_not_sent() {
+        let mut app = test_app();
+        app.composer = "/nope".into();
+        app.submit();
+        assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
+        assert!(app.sessions.current().messages.is_empty());
+    }
+
+    #[test]
+    fn slash_model_argument_sets_directly_and_resolves() {
+        let mut app = test_app();
+        app.models.ids = vec!["AcmeAI/acme-model-1".into(), "OtherOrg/other-model".into()];
+        // Exact match, case-insensitive.
+        app.composer = "/model acmeai/acme-model-1".into();
+        app.submit();
+        assert_eq!(app.config.model, "AcmeAI/acme-model-1");
+        // Unique suffix shorthand.
+        app.composer = "/model acme-model-1".into();
+        app.submit();
+        assert_eq!(app.config.model, "AcmeAI/acme-model-1");
+        // Unknown → set exactly as typed.
+        app.composer = "/model totally/unknown".into();
+        app.submit();
+        assert_eq!(app.config.model, "totally/unknown");
+        assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
+    }
+
+    #[test]
+    fn submit_routes_provider_slash_command() {
+        let mut app = test_app();
+        // Gateways are declared as custom providers.
+        app.config
+            .custom_providers
+            .push(crate::config::CustomProvider {
+                id: "acme".into(),
+                name: Some("Acme".into()),
+                base_url: "https://api.acme.example/v1".into(),
+                api_key: None,
+                model: Some("acme-model-9".into()),
+            });
+        app.composer = "/provider acme".into();
+        app.submit();
+        assert_eq!(app.config.provider, "acme");
+        assert_eq!(app.config.base_url, "https://api.acme.example/v1");
+        assert_eq!(app.config.model, "acme-model-9");
+        assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn unknown_provider_reports_error() {
+        let mut app = test_app();
+        app.composer = "/provider unknown_prov".into();
+        app.submit();
+        assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
+    }
+
+    #[test]
+    fn agent_toggle_works() {
+        let mut app = test_app();
+        let initial = app.agent_mode;
+        app.composer = "/agent".into();
+        app.submit();
+        assert_ne!(app.agent_mode, initial);
+        assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
+    }
+
+    #[test]
+    fn approve_toggles_between_auto_and_manual() {
+        let mut app = test_app();
+        assert!(!app.manual_approval, "tools start in auto");
+        app.composer = "/approve".into();
+        app.submit();
+        assert!(app.manual_approval);
+        assert!(matches!(
+            app.cells.last(),
+            Some(Cell::Notice(text)) if text.contains("manual")
+        ));
+        app.composer = "/approve".into();
+        app.submit();
+        assert!(!app.manual_approval);
+        assert!(matches!(
+            app.cells.last(),
+            Some(Cell::Notice(text)) if text.contains("auto")
+        ));
+    }
+
+    #[test]
+    fn approve_with_a_mode_sets_it_instead_of_toggling() {
+        let mut app = test_app();
+        for _ in 0..2 {
+            app.composer = "/approve manual".into();
+            app.submit();
+            assert!(app.manual_approval, "naming manual twice must stay manual");
+        }
+        app.composer = "/approve AUTO".into();
+        app.submit();
+        assert!(!app.manual_approval);
+
+        // Anything else is reported and changes nothing.
+        app.composer = "/approve sometimes".into();
+        app.submit();
+        assert!(!app.manual_approval);
+        assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
+    }
+
+    #[test]
+    fn sandbox_status_does_not_default_to_crate_root() {
+        let app = test_app();
+        assert!(!app.sandbox.has_target());
+        let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_ne!(app.sandbox.config.workspace_root, crate_root);
+    }
+
+    #[test]
+    fn sandbox_command_sets_explicit_target() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!("chatTUI_cmd_dst_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        app.composer = format!("/sandbox {}", dir.display());
+        app.submit();
+        assert!(app.sandbox.has_target());
+        let root = app.sandbox.config.workspace_root.canonicalize().unwrap();
+        let expected = dir.canonicalize().unwrap();
+        assert_eq!(root, expected);
+        let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
+        assert_ne!(root, crate_root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_colon_syntax_sets_target() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!("chatTUI_cmd_colon_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        app.composer = format!("/sandbox: {}", dir.display());
+        app.submit();
+        assert!(app.sandbox.has_target());
+        assert_eq!(
+            app.sandbox.config.workspace_root.canonicalize().unwrap(),
+            dir.canonicalize().unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
